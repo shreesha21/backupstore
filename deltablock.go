@@ -20,6 +20,13 @@ type DeltaBackupConfig struct {
 	Labels   map[string]string
 }
 
+type DeltaRestoreConfig struct {
+	BackupURL      string
+	DeltaOps       DeltaRestoreOperations
+	LastBackupName string
+	SnapshotName   string
+}
+
 type BlockMapping struct {
 	Offset        int64
 	BlockChecksum string
@@ -32,6 +39,10 @@ type DeltaBlockBackupOperations interface {
 	ReadSnapshot(id, volumeID string, start int64, data []byte) error
 	CloseSnapshot(id, volumeID string) error
 	UpdateBackupStatus(id, volumeID string, backupProgress int, backupURL string, err string) error
+}
+
+type DeltaRestoreOperations interface {
+	UpdateRestoreStatus(id string, snapshot string, restoreProgress int, err error)
 }
 
 const (
@@ -285,43 +296,54 @@ func mergeSnapshotMap(deltaBackup, lastBackup *Backup) *Backup {
 	return backup
 }
 
-func RestoreDeltaBlockBackup(backupURL, volDevName string) error {
+func RestoreDeltaBlockBackup(config *DeltaRestoreConfig) (string, error) {
+	//func RestoreDeltaBlockBackup(backupURL, volDevName string) error {
+	if config == nil {
+		return "", fmt.Errorf("invalid empty config for restore")
+	}
+
+	volDevName := config.SnapshotName
+	backupURL := config.BackupURL
+	deltaOps := config.DeltaOps
+	if deltaOps == nil {
+		return "", fmt.Errorf("missing DeltaBlockBackupOperations")
+	}
+
 	bsDriver, err := GetBackupStoreDriver(backupURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	srcBackupName, srcVolumeName, err := decodeBackupURL(backupURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	vol, err := loadVolume(srcVolumeName, bsDriver)
 	if err != nil {
-		return generateError(logrus.Fields{
+		return "", generateError(logrus.Fields{
 			LogFieldVolume:    srcVolumeName,
 			LogEventBackupURL: backupURL,
 		}, "Volume doesn't exist in backupstore: %v", err)
 	}
 
 	if vol.Size == 0 || vol.Size%DEFAULT_BLOCK_SIZE != 0 {
-		return fmt.Errorf("Read invalid volume size %v", vol.Size)
+		return "", fmt.Errorf("Read invalid volume size %v", vol.Size)
 	}
 
 	volDev, err := os.Create(volDevName)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer volDev.Close()
 
 	stat, err := volDev.Stat()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	backup, err := loadBackup(srcBackupName, srcVolumeName, bsDriver)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	log.WithFields(logrus.Fields{
@@ -333,23 +355,32 @@ func RestoreDeltaBlockBackup(backupURL, volDevName string) error {
 		LogFieldVolumeDev:  volDevName,
 		LogEventBackupURL:  backupURL,
 	}).Debug()
-	blkCounts := len(backup.Blocks)
-	for i, block := range backup.Blocks {
-		log.Debugf("Restore for %v: block %v, %v/%v", volDevName, block.BlockChecksum, i+1, blkCounts)
-		if err := restoreBlockToFile(srcVolumeName, volDev, bsDriver, block); err != nil {
-			return err
-		}
-	}
 
-	// We want to truncate regular files, but not device
-	if stat.Mode()&os.ModeType == 0 {
-		log.Debugf("Truncate %v to size %v", volDevName, vol.Size)
-		if err := volDev.Truncate(vol.Size); err != nil {
-			return err
-		}
-	}
+	restoreID := util.GenerateName("restore")
 
-	return nil
+	go func() {
+		defer volDev.Close()
+		blkCounts := len(backup.Blocks)
+		var progress int
+		for i, block := range backup.Blocks {
+			log.Debugf("Restore for %v: block %v, %v/%v", volDevName, block.BlockChecksum, i+1, blkCounts)
+			if err := restoreBlockToFile(srcVolumeName, volDev, bsDriver, block); err != nil {
+				deltaOps.UpdateRestoreStatus(restoreID, volDevName, progress, err)
+			}
+			progress = int((float64(i) / float64(blkCounts)) * PROGRESS_PERCENTAGE_BACKUP_SNAPSHOT)
+		}
+
+		// We want to truncate regular files, but not device
+		if stat.Mode()&os.ModeType == 0 {
+			log.Debugf("Truncate %v to size %v", volDevName, vol.Size)
+			if err := volDev.Truncate(vol.Size); err != nil {
+				deltaOps.UpdateRestoreStatus(restoreID, volDevName, progress, err)
+			}
+		}
+		deltaOps.UpdateRestoreStatus(restoreID, volDevName, PROGRESS_PERCENTAGE_BACKUP_TOTAL, err)
+	}()
+
+	return restoreID, nil
 }
 
 func restoreBlockToFile(volumeName string, volDev *os.File, bsDriver BackupStoreDriver, blk BlockMapping) error {
